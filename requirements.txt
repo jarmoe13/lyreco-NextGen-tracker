@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+pygooglenews
+duckduckgo-search>=5.0
+transformers
+torch
+sentencepiece
