@@ -1,210 +1,189 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from pygooglenews import GoogleNews
-from duckduckgo_search import DDGS
+import requests
+import json
 from transformers import pipeline
-import time
+from datetime import datetime
 
 # --- CONFIG ---
-st.set_page_config(page_title="Lyreco Digital & Market Intel", layout="wide", page_icon="📡")
+st.set_page_config(page_title="Lyreco Intel [PRO]", layout="wide", page_icon="💎")
 
-# --- TARGET MARKETS & KEYWORDS (BROADENED) ---
-# Teraz słowa są szersze. Jeśli nie znajdzie "launch", znajdzie "digital".
-MARKETS = {
-    "France 🇫🇷": {
-        "geo": "FR", "lang": "fr", 
-        "keywords": ["digital", "e-commerce", "commande", "site", "app", "RSE", "logistique"],
-        "fallback": True
-    },
-    "Poland 🇵🇱": {
-        "geo": "PL", "lang": "pl", 
-        "keywords": ["online", "platforma", "cyfryzacja", "sklep", "aplikacja", "CSR", "magazyn"],
-        "fallback": True
-    },
-    "Denmark 🇩🇰": {
-        "geo": "DK", "lang": "da", 
-        "keywords": ["digital", "webshop", "online", "bæredygtighed", "app"],
-        "fallback": True
-    },
-    "Italy 🇮🇹": {
-        "geo": "IT", "lang": "it", 
-        "keywords": ["digitale", "piattaforma", "sito", "sostenibilità", "ecommerce"],
-        "fallback": True
-    },
-    "UK & Ireland 🇬🇧🇮🇪": {
-        "geo": "GB", "lang": "en", 
-        "keywords": ["digital", "online", "platform", "sustainability", "supply chain"],
-        "fallback": True
-    }
-}
+# --- API SETUP ---
+# Próbujemy pobrać klucz z sekretów Streamlit Cloud
+try:
+    API_KEY = st.secrets["SERPER_API_KEY"]
+except:
+    # Fallback dla testów lokalnych lub gdy sekret nie jest ustawiony
+    API_KEY = None
 
-# --- AI SETUP ---
+# --- AI MODEL ---
 @st.cache_resource
 def load_model():
-    # Używamy lekkiego modelu, żeby nie zapchać pamięci przy szerszym wyszukiwaniu
     return pipeline("sentiment-analysis", 
                     model="cardiffnlp/twitter-xlm-roberta-base-sentiment", 
                     tokenizer="cardiffnlp/twitter-xlm-roberta-base-sentiment")
 
 try:
-    with st.spinner("Loading AI Engines..."):
+    with st.spinner("Initializing AI Engine..."):
         sentiment_pipeline = load_model()
-except: st.error("AI Model Error")
+except: pass
 
 # --- LOGIC ---
-def map_label(label):
-    if 'label_0' in str(label).lower(): return 'Negative'
-    if 'label_2' in str(label).lower(): return 'Positive'
+def map_sentiment(label):
+    if 'label_0' in str(label).lower() or 'neg' in str(label).lower(): return 'Negative'
+    if 'label_2' in str(label).lower() or 'pos' in str(label).lower(): return 'Positive'
     return 'Neutral'
 
 def analyze_sentiment(df):
     if df.empty: return df
-    results = sentiment_pipeline(df['title'].tolist(), truncation=True, max_length=512)
-    df['sentiment'] = [map_label(r['label']) for r in results]
-    df['score'] = [r['score'] for r in results]
+    try:
+        results = sentiment_pipeline(df['Title'].tolist(), truncation=True, max_length=512)
+        df['sentiment'] = [map_sentiment(r['label']) for r in results]
+        df['score'] = [r['score'] for r in results]
+    except Exception as e:
+        st.error(f"AI Error: {e}")
+        df['sentiment'] = "Neutral"
+        df['score'] = 0.5
     return df
 
-def search_market(market_name, config):
-    data = []
-    base_query = "Lyreco"
+def fetch_serper_data(query, country_code, api_key):
+    """Profesjonalne pobieranie danych z Google via Serper.dev"""
+    url = "https://google.serper.dev/search"
     
-    # 1. Google News (Broad Search)
+    # Parametry zapytania (gl = geo location, hl = host language)
+    payload = json.dumps({
+        "q": query,
+        "gl": country_code.lower(),
+        "num": 20, # Pobieramy 20 wyników na kraj
+        "tbs": "qdr:m6" # Ostatnie 6 miesięcy (qdr:m6)
+    })
+    
+    headers = {
+        'X-API-KEY': api_key,
+        'Content-Type': 'application/json'
+    }
+
     try:
-        gn = GoogleNews(lang=config['lang'], country=config['geo'])
-        # Szukamy ogólnie Lyreco, a potem filtrujemy w Pythonie (skuteczniejsze)
-        search = gn.search(base_query, when="6m")
+        response = requests.request("POST", url, headers=headers, data=payload)
+        results = response.json()
         
-        for entry in search['entries']:
-            # Sprawdzamy czy tytuł zawiera słowa kluczowe LUB czy to fallback
-            title_lower = entry.title.lower()
-            topic = "General Brand News" # Domyślna kategoria
-            
-            for kw in config['keywords']:
-                if kw in title_lower:
-                    topic = f"Topic: {kw.capitalize()}"
-                    break
-            
-            data.append({
-                'Market': market_name,
-                'Source': 'Google News',
-                'Title': entry.title,
-                'Date': entry.published,
-                'Link': entry.link,
-                'Topic': topic
-            })
-    except: pass
-
-    # 2. DuckDuckGo (LinkedIn & Context)
-    try:
-        with DDGS() as ddgs:
-            # Trick: szukamy na LinkedIn w danym kraju
-            q_social = f'site:linkedin.com/company/lyreco "{config["lang"]}"'
-            results = list(ddgs.text(q_social, max_results=4))
-            for r in results:
-                data.append({
-                    'Market': market_name,
-                    'Source': 'LinkedIn / Social',
-                    'Title': r['title'],
-                    'Date': None,
-                    'Link': r['href'],
-                    'Topic': "Digital/Corporate Update"
+        parsed_data = []
+        
+        # 1. Wyniki organiczne (Organic Search)
+        if 'organic' in results:
+            for r in results['organic']:
+                parsed_data.append({
+                    'Source': 'Web/Organic',
+                    'Title': r.get('title', 'No Title'),
+                    'Link': r.get('link', '#'),
+                    'Snippet': r.get('snippet', ''),
+                    'Date': r.get('date', 'Recent') # Serper czasem daje datę tekstową "2 days ago"
                 })
-    except: pass
-    
-    return data
+                
+        # 2. Wyniki News (Top Stories) - jeśli są
+        if 'news' in results:
+             for r in results['news']:
+                parsed_data.append({
+                    'Source': 'Google News',
+                    'Title': r.get('title', 'No Title'),
+                    'Link': r.get('link', '#'),
+                    'Snippet': r.get('snippet', ''),
+                    'Date': r.get('date', 'Recent')
+                })
+                
+        return parsed_data
+    except Exception as e:
+        st.error(f"API Connection Error: {e}")
+        return []
 
-# --- UI ---
-st.title("📡 Lyreco Market Intelligence Radar")
-st.markdown("**Scope:** Digital footprint, E-commerce signals & General Brand Activity across Europe.")
+# --- UI LAYOUT ---
+st.title("💎 Lyreco Strategic Intel [Premium API]")
+st.markdown("**Powered by Serper.dev (Google Engine)** - No more blocks, just data.")
 
+# Sidebar Configuration
 with st.sidebar:
-    st.header("Scanning Regions")
-    selected_markets = []
-    for market in MARKETS.keys():
-        if st.checkbox(market, value=True):
-            selected_markets.append(market)
+    st.header("Settings")
+    
+    # Sprawdzenie klucza
+    if not API_KEY:
+        st.warning("⚠️ Brak klucza API w Secrets!")
+        user_key = st.text_input("Podaj klucz Serper.dev ręcznie:", type="password")
+        if user_key:
+            API_KEY = user_key
+    else:
+        st.success("✅ API Key Loaded from Secrets")
     
     st.divider()
-    run_btn = st.button("🚀 FULL SCAN START", type="primary")
+    
+    # Konfiguracja rynków
+    MARKETS = {
+        "France 🇫🇷": {"code": "fr", "query": "Lyreco e-commerce avis"},
+        "Poland 🇵🇱": {"code": "pl", "query": "Lyreco platforma opinie"},
+        "UK 🇬🇧": {"code": "gb", "query": "Lyreco webshop reviews"},
+        "Italy 🇮🇹": {"code": "it", "query": "Lyreco recensioni servizio"},
+    }
+    
+    selected_markets = st.multiselect("Markets to Scan:", list(MARKETS.keys()), default=list(MARKETS.keys()))
+    run_btn = st.button("🚀 LAUNCH PREMIUM SCAN", type="primary")
 
+# Main Logic
 if run_btn:
-    all_results = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, market in enumerate(selected_markets):
-        progress_bar.progress((i + 1) / len(selected_markets))
-        status_text.text(f"📡 Intercepting signals from {market}...")
-        
-        market_data = search_market(market, MARKETS[market])
-        all_results.extend(market_data)
-        
-    df = pd.DataFrame(all_results)
-    progress_bar.empty()
-    status_text.empty()
-    
-    if df.empty:
-        st.error("Total radio silence. This is highly unusual. Check internet connection.")
+    if not API_KEY:
+        st.error("Stop! Musisz podać klucz API, aby uruchomić tryb Premium.")
     else:
-        # Data Cleanup
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', utc=True)
-        df = analyze_sentiment(df)
+        all_data = []
+        progress = st.progress(0)
         
-        # --- DASHBOARD ---
-        
-        # KPI ROW
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Total Signals Detected", len(df))
-        kpi2.metric("Active Markets", df['Market'].nunique())
-        top_topic = df['Topic'].mode()[0] if not df.empty else "N/A"
-        kpi3.metric("Top Discussion Topic", top_topic)
-        
-        st.divider()
-        
-        # 1. Market Heatmap
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("🌍 Activity by Market")
-            market_counts = df['Market'].value_counts().reset_index()
-            market_counts.columns = ['Market', 'Signals']
-            fig_bar = px.bar(market_counts, x='Market', y='Signals', color='Signals', 
-                             color_continuous_scale='Blues', text_auto=True)
-            st.plotly_chart(fig_bar, use_container_width=True)
-        
-        with c2:
-            st.subheader("🤖 Sentiment AI Analysis")
-            fig_pie = px.pie(df, names='sentiment', color='sentiment', 
-                             color_discrete_map={'Positive':'#00CC96', 'Neutral':'#AB63FA', 'Negative':'#EF553B'})
-            st.plotly_chart(fig_pie, use_container_width=True)
+        for i, market in enumerate(selected_markets):
+            config = MARKETS[market]
+            st.toast(f"Scanning {market} via Google API...")
             
-        # 2. Topic Breakdown
-        st.subheader("🔥 What are they talking about?")
-        # Odfiltrujemy "General Brand News" żeby zobaczyć konkrety
-        specific_topics = df[df['Topic'] != "General Brand News"]
-        if not specific_topics.empty:
-            fig_topics = px.treemap(specific_topics, path=['Market', 'Topic'], color='sentiment')
-            st.plotly_chart(fig_topics, use_container_width=True)
+            # Pobieranie danych
+            raw_data = fetch_serper_data(config['query'], config['code'], API_KEY)
+            
+            # Dodanie etykiety rynku
+            for item in raw_data:
+                item['Market'] = market
+                all_data.append(item)
+            
+            progress.progress((i + 1) / len(selected_markets))
+            
+        progress.empty()
+        
+        # Przetwarzanie
+        if all_data:
+            df = pd.DataFrame(all_data)
+            df = analyze_sentiment(df)
+            
+            # --- DASHBOARD ---
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Premium Data Points", len(df))
+            k2.metric("Market Coverage", len(selected_markets))
+            positive_share = len(df[df['sentiment'] == 'Positive']) / len(df) * 100
+            k3.metric("Positive Sentiment", f"{positive_share:.1f}%")
+            
+            st.divider()
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("🌍 Mentions by Market")
+                fig_bar = px.bar(df['Market'].value_counts().reset_index(), x='count', y='Market', 
+                                 orientation='h', text_auto=True, color='count')
+                st.plotly_chart(fig_bar, use_container_width=True)
+            
+            with c2:
+                st.subheader("🧠 AI Sentiment Analysis")
+                fig_pie = px.pie(df, names='sentiment', color='sentiment', 
+                                 color_discrete_map={'Positive':'#00CC96', 'Neutral':'#AB63FA', 'Negative':'#EF553B'})
+                st.plotly_chart(fig_pie, use_container_width=True)
+                
+            st.subheader("📑 Verifiable Sources (Clickable)")
+            st.dataframe(
+                df[['Market', 'Title', 'sentiment', 'Link']],
+                column_config={"Link": st.column_config.LinkColumn("Source URL")},
+                use_container_width=True
+            )
+            
         else:
-            st.info("Mostly general news detected. No specific digital launch keywords spiked.")
-
-        # 3. The Feed
-        st.subheader("🗞️ Intelligence Feed (Live)")
-        
-        # Filters
-        filter_col1, filter_col2 = st.columns(2)
-        with filter_col1:
-            m_filter = st.multiselect("Filter by Market", options=df['Market'].unique(), default=df['Market'].unique())
-        with filter_col2:
-            s_filter = st.multiselect("Filter by Sentiment", options=df['sentiment'].unique(), default=df['sentiment'].unique())
-            
-        filtered_df = df[df['Market'].isin(m_filter) & df['sentiment'].isin(s_filter)]
-        
-        st.dataframe(
-            filtered_df[['Date', 'Market', 'Topic', 'Title', 'sentiment', 'Link']],
-            column_config={
-                "Link": st.column_config.LinkColumn("Source"),
-                "Topic": st.column_config.TextColumn("Category"),
-            },
-            use_container_width=True
-        )
+            st.warning("API nie zwróciło wyników. Sprawdź limity na serper.dev.")
